@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# -----------------------------
-# Page configuration
-# -----------------------------
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 st.set_page_config(
     page_title="CV Fit Screening",
     page_icon="📄",
@@ -22,12 +22,12 @@ st.set_page_config(
 )
 
 st.title("📄 CV Fit Screening Dashboard")
-st.caption("Upload CVs → Gemini API → Fit Score → Google Sheets")
+st.caption("Upload CVs → Gemini screening → Fit Score → Google Sheets")
 
 
-# -----------------------------
-# Structured Gemini response
-# -----------------------------
+# ============================================================
+# GEMINI RESPONSE SCHEMA
+# ============================================================
 class ScreeningResult(BaseModel):
     name: str = Field(
         description="Candidate's full name. Use an empty string if not found."
@@ -46,17 +46,18 @@ class ScreeningResult(BaseModel):
     )
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def get_secret(name: str, default: str = ""):
-    """Read a Streamlit secret first, then fall back to environment variables."""
+# ============================================================
+# HELPERS
+# ============================================================
+def get_secret(name: str, default: str = "") -> str:
+    """Read Streamlit Secrets first, then environment variables."""
     try:
         value = st.secrets.get(name, default)
         if value:
-            return value
+            return str(value)
     except Exception:
         pass
+
     return os.getenv(name, default)
 
 
@@ -71,6 +72,7 @@ def screen_cv(
     job_description: str,
     instructions: str,
 ):
+    """Upload one PDF to Gemini and return structured screening results."""
     uploaded = client.files.upload(file=pdf_path)
 
     prompt = f"""
@@ -85,16 +87,17 @@ USER INSTRUCTIONS:
 TASK:
 Evaluate the attached CV against the job description.
 
-Scoring rules:
+SCORING RULES:
 - Return a fit_score from 0 to 100.
 - Base the score only on evidence in the CV and the supplied job description.
-- Consider relevant skills, experience, education, responsibilities, tools/technologies,
-  seniority and other explicit requirements.
+- Consider relevant skills, experience, education, responsibilities,
+  tools/technologies, seniority and other explicit requirements.
+- Mandatory requirements should have more weight than nice-to-have requirements.
 - Do not invent missing information.
 - Missing information should not automatically mean the candidate is unsuitable,
   but do not assume that an unstated qualification exists.
 - Extract the candidate's name, email and phone number from the CV.
-- Keep the rationale concise.
+- Keep the rationale concise and evidence-based.
 """
 
     response = client.models.generate_content(
@@ -109,51 +112,77 @@ Scoring rules:
 
     result = ScreeningResult.model_validate_json(response.text)
     result.fit_score = max(0, min(100, float(result.fit_score)))
+
     return result
 
 
-def get_gsheet_client(credentials_path: str = ""):
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+def get_gsheet_client():
     """
-    Local:
-        Use a service-account JSON file if credentials_path exists.
+    Use Streamlit Cloud Secrets.
 
-    Streamlit Cloud:
-        Use [gcp_service_account] from Streamlit Secrets.
+    Expected Secrets structure:
+
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = """..."""
+    client_email = "..."
+    client_id = "..."
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "..."
+    client_x509_cert_url = "..."
+    universe_domain = "googleapis.com"
     """
-    if credentials_path:
-        path = Path(credentials_path)
-        if path.exists():
-            return gspread.service_account(filename=str(path))
-
     try:
         credentials = dict(st.secrets["gcp_service_account"])
-        return gspread.service_account_from_dict(credentials)
     except Exception as e:
         raise ValueError(
-            "Google Sheets credentials are not configured. "
-            "On Streamlit Cloud, add a [gcp_service_account] section "
-            "to App Settings → Secrets."
+            "Google service-account credentials are missing. "
+            "Add the [gcp_service_account] section in "
+            "Streamlit Cloud → Settings → Secrets."
         ) from e
+
+    return gspread.service_account_from_dict(credentials)
+
+
+def test_google_sheet(spreadsheet_url: str, worksheet_name: str):
+    """Test whether the configured service account can access the sheet."""
+    gc = get_gsheet_client()
+    spreadsheet = gc.open_by_url(spreadsheet_url)
+    worksheet = spreadsheet.worksheet(worksheet_name)
+    return spreadsheet.title, worksheet.title
 
 
 def save_to_google_sheet(
-    credentials_path: str,
     spreadsheet_url: str,
     worksheet_name: str,
     candidate: dict,
 ):
-    gc = get_gsheet_client(credentials_path)
-    sh = gc.open_by_url(spreadsheet_url)
-    ws = sh.worksheet(worksheet_name)
+    """Append one candidate to the configured Google Sheet."""
+    gc = get_gsheet_client()
 
-    existing = ws.get_all_values()
+    spreadsheet = gc.open_by_url(spreadsheet_url)
+    worksheet = spreadsheet.worksheet(worksheet_name)
+
+    existing = worksheet.get_all_values()
 
     if not existing:
-        ws.append_row(
-            ["Name", "Email", "Phone", "Fit Score", "CV File"]
+        worksheet.append_row(
+            [
+                "Name",
+                "Email",
+                "Phone",
+                "Fit Score",
+                "CV File",
+            ]
         )
 
-    ws.append_row(
+    worksheet.append_row(
         [
             candidate.get("name", ""),
             candidate.get("email", ""),
@@ -164,8 +193,11 @@ def save_to_google_sheet(
     )
 
 
+# ============================================================
+# TEMPORARY PDF FILE
+# ============================================================
 def save_uploaded_pdf(uploaded_file) -> Path:
-    """Write an uploaded PDF to a temporary file for Gemini."""
+    """Save a Streamlit uploaded PDF temporarily for Gemini."""
     with tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".pdf",
@@ -174,9 +206,9 @@ def save_uploaded_pdf(uploaded_file) -> Path:
         return Path(tmp.name)
 
 
-# -----------------------------
-# Session state
-# -----------------------------
+# ============================================================
+# SESSION STATE
+# ============================================================
 if "results" not in st.session_state:
     st.session_state.results = []
 
@@ -184,22 +216,25 @@ if "screening_errors" not in st.session_state:
     st.session_state.screening_errors = []
 
 
-# -----------------------------
-# Sidebar configuration
-# -----------------------------
+# ============================================================
+# SIDEBAR
+# ============================================================
 with st.sidebar:
     st.header("⚙️ Configuration")
 
     api_key = st.text_input(
         "Gemini API key",
-        value=get_secret("GEMINI_API_KEY", ""),
+        value=get_secret("GEMINI_API_KEY"),
         type="password",
-        help="On Streamlit Cloud, store this in App Settings → Secrets.",
+        help="On Streamlit Cloud, store this in Secrets.",
     )
 
     model_name = st.text_input(
         "Gemini model",
-        value=get_secret("GEMINI_MODEL", "gemini-2.5-flash"),
+        value=get_secret(
+            "GEMINI_MODEL",
+            "gemini-2.5-flash",
+        ),
     )
 
     threshold = st.number_input(
@@ -211,21 +246,12 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Google Sheets")
 
-    credentials_path = st.text_input(
-        "Service account JSON (local only)",
-        value=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", ""),
-        placeholder=r"C:\cv-screening\service_account.json",
-        help=(
-            "For Streamlit Cloud, leave this blank and use "
-            "[gcp_service_account] in Secrets."
-        ),
-    )
+    st.subheader("Google Sheets")
 
     spreadsheet_url = st.text_input(
         "Existing Google Sheet URL",
-        value=get_secret("GOOGLE_SHEET_URL", ""),
+        value=get_secret("GOOGLE_SHEET_URL"),
         placeholder="https://docs.google.com/spreadsheets/d/...",
     )
 
@@ -234,19 +260,39 @@ with st.sidebar:
         value=get_secret("GOOGLE_WORKSHEET", "Sheet1"),
     )
 
+    if st.button(
+        "🔗 Test Google Sheets Connection",
+        use_container_width=True,
+    ):
+        if not spreadsheet_url:
+            st.error("Add the Google Sheet URL first.")
+        else:
+            try:
+                spreadsheet_title, worksheet_title = test_google_sheet(
+                    spreadsheet_url,
+                    worksheet_name,
+                )
 
-# -----------------------------
-# CV upload
-# -----------------------------
+                st.success(
+                    f"Connected to '{spreadsheet_title}' → "
+                    f"'{worksheet_title}'"
+                )
+            except Exception as e:
+                st.error(f"Connection failed: {e}")
+
+
+# ============================================================
+# CV UPLOAD
+# ============================================================
 st.subheader("📤 Upload CVs")
 
 uploaded_files = st.file_uploader(
-    "Select all the PDF CVs you want to screen",
+    "Select all PDF CVs you want to screen",
     type=["pdf"],
     accept_multiple_files=True,
     help=(
-        "Open your local CV folder and select all PDFs at once. "
-        "On Windows, use Ctrl+A to select every PDF."
+        "Open your local CV folder and select multiple PDFs at once. "
+        "On Windows, press Ctrl+A to select all PDFs."
     ),
 )
 
@@ -260,18 +306,19 @@ if uploaded_files:
         f"{total_size_mb:.1f} MB total"
     )
 
-    with st.expander("View selected CVs"):
+    with st.expander("📄 View selected CVs"):
         for file in uploaded_files:
-            st.write(f"📄 {file.name}")
+            st.write(f"• {file.name}")
 
 
-# -----------------------------
-# Main inputs
-# -----------------------------
+# ============================================================
+# JOB DESCRIPTION + INSTRUCTIONS
+# ============================================================
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Job Description")
+
     job_description = st.text_area(
         "Paste the job description",
         height=300,
@@ -280,6 +327,7 @@ with col1:
 
 with col2:
     st.subheader("Screening Instructions")
+
     instructions = st.text_area(
         "Additional instructions for Gemini",
         height=300,
@@ -291,9 +339,9 @@ with col2:
     )
 
 
-# -----------------------------
-# Scan / analyze
-# -----------------------------
+# ============================================================
+# SCREEN BUTTON
+# ============================================================
 if st.button(
     "🚀 Scan and Screen All Uploaded CVs",
     type="primary",
@@ -307,7 +355,7 @@ if st.button(
         st.stop()
 
     if not api_key:
-        st.error("Please enter your Gemini API key.")
+        st.error("Please configure your Gemini API key.")
         st.stop()
 
     if not job_description.strip():
@@ -375,9 +423,9 @@ if st.button(
     )
 
 
-# -----------------------------
-# Dashboard
-# -----------------------------
+# ============================================================
+# RESULTS DASHBOARD
+# ============================================================
 if st.session_state.results:
     st.divider()
 
@@ -392,35 +440,57 @@ if st.session_state.results:
         ascending=False,
     )
 
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
     m1, m2, m3 = st.columns(3)
 
-    m1.metric("CVs screened", len(all_df))
-    m2.metric("Shortlisted", len(shortlisted_df))
-    m3.metric("Threshold", f"{threshold:.0f}%")
+    m1.metric(
+        "CVs screened",
+        len(all_df),
+    )
 
-    # -----------------------------
+    m2.metric(
+        "Shortlisted",
+        len(shortlisted_df),
+    )
+
+    m3.metric(
+        "Threshold",
+        f"{threshold:.0f}%",
+    )
+
+    # --------------------------------------------------------
     # Shortlisted candidates
-    # -----------------------------
+    # --------------------------------------------------------
     st.subheader(
         f"✅ Shortlisted Candidates (≥ {threshold:.0f}%)"
     )
 
     if shortlisted_df.empty:
-        st.info("No candidates reached the configured threshold.")
+        st.info(
+            "No candidates reached the configured threshold."
+        )
+
     else:
         st.caption(
-            "Click **Save to Google Sheets** to append a candidate."
+            "Click **Save to Google Sheets** to add a candidate "
+            "to the configured worksheet."
         )
 
         for idx, row in shortlisted_df.reset_index(drop=True).iterrows():
+
             c1, c2, c3, c4, c5, c6 = st.columns(
-                [2.1, 2.3, 1.7, 1.0, 2.8, 1.5]
+                [2.1, 2.3, 1.7, 1.0, 2.8, 1.6]
             )
 
             c1.write(row["name"] or "Not found")
             c2.write(row["email"] or "Not found")
             c3.write(row["phone"] or "Not found")
-            c4.metric("Fit", f'{row["fit_score"]:.1f}%')
+            c4.metric(
+                "Fit",
+                f'{row["fit_score"]:.1f}%',
+            )
             c5.write(row["file"])
 
             if c6.button(
@@ -429,12 +499,11 @@ if st.session_state.results:
             ):
                 if not spreadsheet_url:
                     st.error(
-                        "Add the existing Google Sheet URL in the sidebar."
+                        "Add the Google Sheet URL in the sidebar."
                     )
                 else:
                     try:
                         save_to_google_sheet(
-                            credentials_path=credentials_path,
                             spreadsheet_url=spreadsheet_url,
                             worksheet_name=worksheet_name,
                             candidate=row.to_dict(),
@@ -453,10 +522,10 @@ if st.session_state.results:
             with st.expander("View screening rationale"):
                 st.write(row["rationale"])
 
-    # -----------------------------
+    # --------------------------------------------------------
     # All screened CVs
-    # -----------------------------
-    st.subheader("All screened CVs")
+    # --------------------------------------------------------
+    st.subheader("All Screened CVs")
 
     display_df = all_df[
         [
@@ -494,9 +563,9 @@ if st.session_state.results:
     )
 
 
-# -----------------------------
-# Errors
-# -----------------------------
+# ============================================================
+# SCREENING ERRORS
+# ============================================================
 if st.session_state.screening_errors:
     st.warning(
         f"{len(st.session_state.screening_errors)} CV(s) "
@@ -508,6 +577,8 @@ if st.session_state.screening_errors:
 
 
 st.divider()
+
 st.caption(
-    "Keep API keys and Google service-account credentials out of Git repositories."
+    "API keys and Google service-account credentials are stored "
+    "outside the application code."
 )
