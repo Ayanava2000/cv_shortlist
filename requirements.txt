@@ -1,0 +1,6 @@
+streamlit>=1.40
+google-genai
+pydantic>=2
+gspread>=6
+python-dotenv
+pandas
